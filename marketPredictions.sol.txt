@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+
+pragma solidity >=0.8.13 <0.8.20;
+
+import "fhevm/abstracts/EIP712WithModifier.sol";
+
+import "fhevm/lib/TFHE.sol";
+
+contract EncryptedPrediction is EIP712WithModifier {
+    mapping(address => uint32) totalScore;
+    mapping(address => mapping(uint256 => Predictions)) predictions;
+    mapping(address => mapping(uint256 => bool)) isPredictor;
+    mapping(uint256 => address) idToAddress;
+    euint32 public debug;
+
+    mapping(address => uint256[]) userIds;
+
+    mapping(address => mapping(address => bool)) whitelist;
+    mapping(address => euint32) eScore;
+    mapping(address => uint256) firstIndex;
+    mapping(address => uint256) lastIndex;
+    uint256 constant mio = 10**6;
+
+    Predictions[] allPredictions;
+
+    struct Predictions {
+        address user;
+        uint256 Id;
+        uint256 timeStamp;
+        euint32 evaluemin;
+        euint32 evaluemax;
+        euint32 erisk;
+        string name;
+    }
+
+    address public immutable oracle;
+    address payable public immutable owner;
+
+    constructor(address _oracle)
+        EIP712WithModifier("Authorization token", "1")
+    {
+        oracle = _oracle;
+        owner = payable(msg.sender);
+    }
+
+    function addPosPrediction(bytes calldata evalue, string memory name)
+        public
+    {
+        euint32 value = TFHE.asEuint32(evalue);
+        (, bytes memory price) = oracle.call(
+            abi.encodeWithSignature(
+                "getPrice(uint256,string)",
+                block.timestamp,
+                name
+            )
+        );
+        uint256 uprice = uint256(bytes32(price));
+        // euint32 emargin = TFHE.asEuint32(99 * uprice / 100);
+        euint32 emargin = TFHE.asEuint32(uprice);
+        euint32 eratio = TFHE.asEuint32(mio / uprice);
+        euint32 eprice = TFHE.asEuint32(uprice);
+        euint32 ediff = TFHE.cmux(
+            TFHE.gt(value, eprice),
+            TFHE.sub(value, eprice),
+            TFHE.sub(eprice, value)
+        );
+        euint32 erisk = TFHE.mul(eratio, ediff);
+        uint256 id = allPredictions.length;
+        Predictions memory pred = Predictions(
+            msg.sender,
+            id,
+            block.timestamp + 10,
+            TFHE.sub(value, emargin),
+            TFHE.add(emargin, value),
+            erisk,
+            name
+        );
+        predictions[msg.sender][id] = pred;
+        userIds[msg.sender].push(id);
+        allPredictions.push(pred);
+    }
+
+    function checkPredictionReward(uint256 id) public {
+        Predictions memory pred = allPredictions[id];
+        require(block.timestamp >= pred.timeStamp, "cant view too early");
+        (, bytes memory price) = oracle.call(
+            abi.encodeWithSignature(
+                "getPrice(uint256,string)",
+                pred.timeStamp,
+                "btc"
+            )
+        );
+        euint32 eprice = TFHE.asEuint32(uint256(bytes32(price)));
+        ebool gt = TFHE.gt(pred.evaluemax, eprice);
+        ebool lt = TFHE.lt(pred.evaluemin, eprice);
+    
+
+        euint8 eand = TFHE.and(TFHE.asEuint8(gt), TFHE.asEuint8(lt));
+        debug = TFHE.asEuint32(eand);
+        eScore[pred.user] = TFHE.add(
+            eScore[pred.user],
+            TFHE.mul(eand, pred.erisk)
+        );
+    }
+
+    function getScore(address user, bytes32 publicKey)
+        public
+        view
+        returns (bytes memory)
+    {
+        return TFHE.reencrypt(eScore[user], publicKey);
+    }
+
+    function getDebug(bytes32 publicKey) public view returns (bytes memory) {
+        return TFHE.reencrypt(debug, publicKey);
+    }
+
+    function getStrat(
+        uint256 id,
+        bytes32 publicKey,
+        bytes calldata signature
+    )
+        public
+        view
+        onlySignedPublicKey(publicKey, signature)
+        returns (bytes memory)
+    {
+        address user = idToAddress[id];
+        require(whitelist[user][msg.sender]);
+        return TFHE.reencrypt(eScore[user], publicKey);
+    }
+
+    function getWhitelisted(address user) public payable {
+        require(msg.value == 1 ether);
+
+        payable(user).transfer(9 * 10**17);
+        owner.transfer(1 * 10**17);
+
+        whitelist[user][msg.sender] = true;
+    }
+}
